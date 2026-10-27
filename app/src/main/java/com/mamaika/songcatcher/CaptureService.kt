@@ -29,6 +29,9 @@ import kotlin.math.abs
 object CaptureBridge {
     @Volatile
     var pending: CompletableDeferred<File>? = null
+
+    @Volatile
+    var lastStats: String = ""
 }
 
 class CaptureService : Service() {
@@ -37,6 +40,7 @@ class CaptureService : Service() {
         suspend fun capture(ctx: Context, code: Int, data: Intent): File {
             val deferred = CompletableDeferred<File>()
             CaptureBridge.pending = deferred
+            CaptureBridge.lastStats = ""
             val i = Intent(ctx, CaptureService::class.java)
                 .putExtra("code", code)
                 .putExtra("data", data)
@@ -124,7 +128,7 @@ class CaptureService : Service() {
                 .setAudioPlaybackCaptureConfig(config)
                 .build()
 
-            val total = sampleRate * 2 * 10 // 10 секунд, 16 бит, моно
+            val total = sampleRate * 2 * 12 // 12 секунд, 16 бит, моно
             val pcm = ByteArray(total)
             var read = 0
             rec.startRecording()
@@ -137,16 +141,35 @@ class CaptureService : Service() {
             rec.release()
 
             var peak = 0
+            var active = 0
             var i = 0
             while (i + 1 < read) {
                 val s = ((pcm[i + 1].toInt() shl 8) or (pcm[i].toInt() and 0xFF)).toShort().toInt()
-                peak = maxOf(peak, abs(s))
+                val a = abs(s)
+                peak = maxOf(peak, a)
+                if (a > 300) active++
                 i += 2
             }
+            val samples = read / 2
+            val pct = if (samples > 0) active * 100 / samples else 0
+            CaptureBridge.lastStats = "записано ${read / 2 / sampleRate} с, пик $peak, звук в $pct% записи"
             if (peak < 100) {
                 throw IllegalStateException(
                     "Звук не захвачен: на телефоне тишина или приложение запретило захват"
                 )
+            }
+
+            // Тихую запись усиливаем: AudD плохо строит отпечаток из слишком тихого звука.
+            if (peak < 20000) {
+                val gain = minOf(30f, 20000f / peak)
+                var j = 0
+                while (j + 1 < read) {
+                    val v0 = ((pcm[j + 1].toInt() shl 8) or (pcm[j].toInt() and 0xFF)).toShort().toInt()
+                    val v = (v0 * gain).toInt().coerceIn(-32768, 32767)
+                    pcm[j] = (v and 0xFF).toByte()
+                    pcm[j + 1] = ((v shr 8) and 0xFF).toByte()
+                    j += 2
+                }
             }
 
             val out = File(cacheDir, "clip.wav")

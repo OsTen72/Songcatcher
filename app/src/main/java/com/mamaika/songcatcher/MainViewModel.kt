@@ -22,6 +22,17 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
+
+/** Найденные видео, ожидающие подтверждения пользователя. */
+class Pending(
+    val candidates: List<Candidate>,
+    val coverUrl: String?,
+    val namesFromVideo: Boolean
+)
 
 class MainViewModel(private val app: Application) : AndroidViewModel(app) {
 
@@ -36,11 +47,22 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
     var progress by mutableStateOf<Float?>(null)
     var token by mutableStateOf(prefs.getString("audd_token", "") ?: "")
     var usePhoneAudio by mutableStateOf(prefs.getBoolean("phone_audio", false))
+    var confirmDownload by mutableStateOf(prefs.getBoolean("confirm_download", true))
     var query by mutableStateOf("")
+    var manualQuery by mutableStateOf("")
     var currentId by mutableStateOf<String?>(null)
     var isPlaying by mutableStateOf(false)
     var shuffle by mutableStateOf(false)
+    var repeatMode by mutableStateOf(Player.REPEAT_MODE_OFF)
+    var position by mutableStateOf(0L)
+    var duration by mutableStateOf(0L)
     var report by mutableStateOf<String?>(null)
+
+    // подтверждение скачивания
+    var pending by mutableStateOf<Pending?>(null)
+    var pendingIndex by mutableStateOf(0)
+    var editArtist by mutableStateOf("")
+    var editTitle by mutableStateOf("")
 
     val visibleTracks: List<Track>
         get() = if (query.isBlank()) tracks.toList() else tracks.filter {
@@ -99,6 +121,10 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         override fun onShuffleModeEnabledChanged(enabled: Boolean) {
             shuffle = enabled
         }
+
+        override fun onRepeatModeChanged(mode: Int) {
+            repeatMode = mode
+        }
     }
 
     private fun toItem(t: Track): MediaItem {
@@ -129,11 +155,22 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         player.addListener(listener)
         if (player.mediaItemCount == 0) {
             player.setMediaItems(tracks.map { toItem(it) })
+            player.repeatMode = prefs.getInt("repeat", Player.REPEAT_MODE_OFF)
+            player.shuffleModeEnabled = prefs.getBoolean("shuffle", false)
         }
-        player.repeatMode = Player.REPEAT_MODE_ALL
+        repeatMode = player.repeatMode
         currentId = player.currentMediaItem?.mediaId
         isPlaying = player.isPlaying
         shuffle = player.shuffleModeEnabled
+
+        // позиция воспроизведения для ползунка
+        viewModelScope.launch {
+            while (true) {
+                position = player.currentPosition
+                duration = player.duration.coerceAtLeast(0L)
+                delay(500)
+            }
+        }
 
         viewModelScope.launch(Dispatchers.IO) {
             try {
@@ -182,7 +219,23 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
     fun previous() = player.seekToPreviousMediaItem()
 
     fun toggleShuffle() {
-        player.shuffleModeEnabled = !player.shuffleModeEnabled
+        val v = !player.shuffleModeEnabled
+        player.shuffleModeEnabled = v
+        prefs.edit().putBoolean("shuffle", v).apply()
+    }
+
+    fun cycleRepeat() {
+        val next = when (player.repeatMode) {
+            Player.REPEAT_MODE_OFF -> Player.REPEAT_MODE_ALL
+            Player.REPEAT_MODE_ALL -> Player.REPEAT_MODE_ONE
+            else -> Player.REPEAT_MODE_OFF
+        }
+        player.repeatMode = next
+        prefs.edit().putInt("repeat", next).apply()
+    }
+
+    fun seekTo(ms: Long) {
+        player.seekTo(ms)
     }
 
     fun delete(track: Track) {
@@ -195,11 +248,25 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         store.save(tracks.toList())
     }
 
+    fun rename(track: Track, artist: String, title: String) {
+        val t = title.trim()
+        if (t.isBlank()) return
+        val updated = track.copy(artist = artist.trim(), title = t)
+        val ti = tracks.indexOfFirst { it.id == track.id }
+        if (ti >= 0) tracks[ti] = updated
+        // играющий трек не трогаем, чтобы не прерывать воспроизведение
+        val pi = indexInPlayer(track.id)
+        if (pi >= 0 && pi != player.currentMediaItemIndex) {
+            player.replaceMediaItem(pi, toItem(updated))
+        }
+        store.save(tracks.toList())
+    }
+
     fun export(track: Track) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 Exporter.export(app, track)
-                status = "Сохранено в Музыка/SongCatcher: ${track.artist} — ${track.title}"
+                status = "Сохранено в Музыка/SongCatcher: ${track.title}"
             } catch (e: Throwable) {
                 status = "Ошибка экспорта: ${e.message}"
             }
@@ -217,13 +284,40 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         prefs.edit().putBoolean("phone_audio", value).apply()
     }
 
-    // ---------- главная кнопка ----------
+    fun updateConfirmDownload(value: Boolean) {
+        confirmDownload = value
+        prefs.edit().putBoolean("confirm_download", value).apply()
+    }
+
+    // ---------- распознавание ----------
+    private fun todayUtc(): String {
+        val f = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+        f.timeZone = TimeZone.getTimeZone("UTC")
+        return f.format(Date())
+    }
+
+    /**
+     * Сначала бесплатный анонимный запрос (его лимит обновляется каждый день).
+     * Если он исчерпан, используем токен, чтобы не тратить разовые бесплатные запросы зря.
+     */
+    private fun recognizeSmart(clip: File): Recognizer.Result? {
+        val tok = token.trim()
+        val today = todayUtc()
+        val anonBlocked = prefs.getString("anon_blocked_day", "") == today
+        if (!anonBlocked || tok.isBlank()) {
+            try {
+                return Recognizer.recognize("", clip)
+            } catch (e: AuddException) {
+                if (tok.isBlank() || !e.isLimit()) throw e
+                prefs.edit().putString("anon_blocked_day", today).apply()
+                mark("анонимный лимит исчерпан")
+            }
+        }
+        return Recognizer.recognize(tok, clip)
+    }
+
     fun catchSong(projection: Pair<Int, Intent>? = null) {
         if (busy) return
-        if (token.isBlank()) {
-            status = "Сначала вставь токен AudD"
-            return
-        }
         viewModelScope.launch {
             busy = true
             progress = null
@@ -232,7 +326,7 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
 
                 mark("запись")
                 val phoneMode = usePhoneAudio && projection != null
-                status = if (phoneMode) "Слушаю звук телефона 10 секунд…" else "Слушаю микрофон 10 секунд…"
+                status = if (phoneMode) "Слушаю звук телефона 12 секунд…" else "Слушаю микрофон 10 секунд…"
                 val clip = if (phoneMode) {
                     CaptureService.capture(app, projection!!.first, projection.second)
                 } else {
@@ -241,47 +335,49 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
 
                 mark("распознавание")
                 status = "Распознаю…"
-                val found = withContext(Dispatchers.IO) { Recognizer.recognize(token.trim(), clip) }
+                val found = withContext(Dispatchers.IO) { recognizeSmart(clip) }
                 if (found == null) {
                     status = "Не удалось распознать. Попробуй другой фрагмент песни"
                     return@launch
                 }
+                prepareDownload(
+                    artist = found.artist,
+                    title = found.title,
+                    query = "${found.artist} ${found.title} audio",
+                    coverUrl = found.coverUrl,
+                    namesFromVideo = false
+                )
+            } catch (e: Throwable) {
+                mark("ошибка: ${e.javaClass.simpleName}")
+                val extra = if (usePhoneAudio && CaptureBridge.lastStats.isNotEmpty() &&
+                    (e.message ?: "").contains("fingerprint")
+                ) "\n[${CaptureBridge.lastStats}]" else ""
+                status = "Ошибка: ${e.message ?: e.javaClass.simpleName}$extra"
+            } finally {
+                busy = false
+                progress = null
+                mark("idle")
+            }
+        }
+    }
 
-                val duplicate = tracks.any {
-                    it.artist.equals(found.artist, true) && it.title.equals(found.title, true)
-                }
-                if (duplicate) {
-                    status = "${found.artist} — ${found.title} уже есть в списке"
-                    return@launch
-                }
-
-                status = "Нашёл: ${found.artist} — ${found.title}. Ищу и качаю…"
-                mark("ожидание yt-dlp")
-                ytReady.await()
-                mark("поиск и скачивание")
-                val file = withContext(Dispatchers.IO) {
-                    Downloader.download(app, "${found.artist} ${found.title} audio") { p ->
-                        progress = if (p >= 0f) p / 100f else null
-                    }
-                }
-
-                val id = file.nameWithoutExtension
-                val coverPath = withContext(Dispatchers.IO) {
-                    val url = found.coverUrl
-                    if (url == null) {
-                        ""
-                    } else {
-                        val dir = File(app.filesDir, "covers").apply { mkdirs() }
-                        val dest = File(dir, "$id.jpg")
-                        if (Recognizer.downloadCover(url, dest)) dest.absolutePath else ""
-                    }
-                }
-
-                val track = Track(id, found.artist, found.title, file.absolutePath, coverPath)
-                tracks.add(0, track)
-                player.addMediaItem(0, toItem(track))
-                store.save(tracks.toList())
-                status = "Добавлено: ${found.artist} — ${found.title}"
+    // ---------- ручной режим: название или ссылка ----------
+    fun downloadManual() {
+        if (busy) return
+        val text = manualQuery.trim()
+        if (text.isBlank()) return
+        viewModelScope.launch {
+            busy = true
+            progress = null
+            try {
+                val started = prepareDownload(
+                    artist = "",
+                    title = "",
+                    query = text,
+                    coverUrl = null,
+                    namesFromVideo = true
+                )
+                if (started) manualQuery = ""
             } catch (e: Throwable) {
                 mark("ошибка: ${e.javaClass.simpleName}")
                 status = "Ошибка: ${e.message ?: e.javaClass.simpleName}"
@@ -291,6 +387,120 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
                 mark("idle")
             }
         }
+    }
+
+    /** Ищет видео. Показывает подтверждение или сразу качает первое. */
+    private suspend fun prepareDownload(
+        artist: String,
+        title: String,
+        query: String,
+        coverUrl: String?,
+        namesFromVideo: Boolean
+    ): Boolean {
+        val isLink = query.startsWith("http://") || query.startsWith("https://")
+        status = if (isLink) "Читаю ссылку…" else "Ищу на YouTube…"
+        mark("ожидание yt-dlp")
+        ytReady.await()
+        mark("поиск")
+        val list = withContext(Dispatchers.IO) {
+            if (isLink) Downloader.info(query) else Downloader.search(query, 5)
+        }
+        if (list.isEmpty()) {
+            status = "Ничего не найдено"
+            return false
+        }
+
+        if (confirmDownload) {
+            pending = Pending(list, coverUrl, namesFromVideo)
+            pendingIndex = 0
+            if (namesFromVideo) {
+                applyNames(list[0])
+            } else {
+                editArtist = artist
+                editTitle = title
+            }
+            status = "Выбери видео для скачивания"
+        } else {
+            val c = list[0]
+            val names = if (namesFromVideo) TitleCleaner.split(c.title, c.channel) else artist to title
+            downloadCandidate(c, names.first, names.second, coverUrl)
+        }
+        return true
+    }
+
+    private fun applyNames(c: Candidate) {
+        val (a, t) = TitleCleaner.split(c.title, c.channel)
+        editArtist = a
+        editTitle = t
+    }
+
+    fun nextCandidate() {
+        val p = pending ?: return
+        pendingIndex = (pendingIndex + 1) % p.candidates.size
+        if (p.namesFromVideo) applyNames(p.candidates[pendingIndex])
+    }
+
+    fun cancelPending() {
+        pending = null
+        status = "Отменено"
+    }
+
+    fun confirmPending() {
+        val p = pending ?: return
+        val c = p.candidates[pendingIndex]
+        val a = editArtist.trim()
+        val t = editTitle.trim().ifBlank { c.title }
+        pending = null
+        viewModelScope.launch {
+            busy = true
+            progress = null
+            try {
+                downloadCandidate(c, a, t, p.coverUrl)
+            } catch (e: Throwable) {
+                mark("ошибка: ${e.javaClass.simpleName}")
+                status = "Ошибка: ${e.message ?: e.javaClass.simpleName}"
+            } finally {
+                busy = false
+                progress = null
+                mark("idle")
+            }
+        }
+    }
+
+    /** Качает выбранное видео, подтягивает обложку и добавляет в список. */
+    private suspend fun downloadCandidate(c: Candidate, artist: String, title: String, coverUrl: String?): Boolean {
+        val label = if (artist.isBlank()) title else "$artist — $title"
+        val duplicate = tracks.any {
+            it.artist.equals(artist, true) && it.title.equals(title, true)
+        }
+        if (duplicate) {
+            status = "$label уже есть в списке"
+            return false
+        }
+
+        status = "Качаю: $label…"
+        mark("скачивание")
+        val file = withContext(Dispatchers.IO) {
+            Downloader.download(app, c.url) { p ->
+                progress = if (p >= 0f) p / 100f else null
+            }
+        }
+
+        val id = file.nameWithoutExtension
+        val coverPath = withContext(Dispatchers.IO) {
+            val dir = File(app.filesDir, "covers").apply { mkdirs() }
+            val dest = File(dir, "$id.jpg")
+            val ok = (coverUrl != null && Recognizer.downloadCover(coverUrl, dest)) ||
+                Recognizer.downloadCover(c.thumbUrl, dest)
+            if (ok) dest.absolutePath else ""
+        }
+
+        val track = Track(id, artist, title, file.absolutePath, coverPath)
+        tracks.add(0, track)
+        player.addMediaItem(0, toItem(track))
+        store.save(tracks.toList())
+        status = "Добавлено: $label"
+        return true
     }
 
     private suspend fun recordMic(): File = withContext(Dispatchers.IO) {
