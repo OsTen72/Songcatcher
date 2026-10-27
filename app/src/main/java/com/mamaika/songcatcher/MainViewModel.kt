@@ -35,10 +35,47 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
     var token by mutableStateOf(prefs.getString("audd_token", "") ?: "")
     var currentId by mutableStateOf<String?>(null)
     var isPlaying by mutableStateOf(false)
+    var report by mutableStateOf<String?>(null)
 
     private val player: ExoPlayer = ExoPlayer.Builder(app).build()
 
+    private val traceFile = File(app.filesDir, "trace.txt")
+    private val crashFile = File(app.filesDir, "crash.txt")
+
+    private fun mark(stage: String) {
+        try {
+            traceFile.appendText(stage + "\n")
+        } catch (_: Throwable) {
+        }
+    }
+
+    fun dismissReport() {
+        report = null
+    }
+
+    private fun loadReport() {
+        val sb = StringBuilder()
+        try {
+            if (crashFile.exists()) {
+                sb.append("Приложение вылетело:\n").append(crashFile.readText().take(2500))
+                crashFile.delete()
+            }
+            if (traceFile.exists()) {
+                val lines = traceFile.readLines().filter { it.isNotBlank() }
+                if (lines.isNotEmpty() && lines.last() != "idle") {
+                    sb.append("\nПоследние этапы прошлого запуска: ")
+                        .append(lines.takeLast(6).joinToString(" > "))
+                }
+                traceFile.delete()
+            }
+        } catch (_: Throwable) {
+        }
+        mark("start")
+        if (sb.isNotEmpty()) report = sb.toString()
+    }
+
     init {
+        loadReport()
         tracks.addAll(store.load())
 
         player.addListener(object : Player.Listener {
@@ -53,17 +90,21 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
 
         viewModelScope.launch(Dispatchers.IO) {
             try {
+                mark("init yt-dlp")
                 YoutubeDL.getInstance().init(app)
+                mark("init ok")
                 ytReady.complete(Unit)
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 ytReady.completeExceptionally(e)
                 return@launch
             }
             // Обновляем yt-dlp: YouTube часто ломает старые версии.
             try {
+                mark("update yt-dlp")
                 YoutubeDL.getInstance().updateYoutubeDL(app, YoutubeDL.UpdateChannel.STABLE)
-            } catch (_: Exception) {
+            } catch (_: Throwable) {
             }
+            mark("idle")
         }
     }
 
@@ -82,9 +123,11 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
             busy = true
             progress = null
             try {
+                mark("запись")
                 status = "Слушаю 10 секунд…"
                 val clip = recordClip()
 
+                mark("распознавание")
                 status = "Распознаю…"
                 val found = withContext(Dispatchers.IO) { Recognizer.recognize(token.trim(), clip) }
                 if (found == null) {
@@ -101,7 +144,9 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
                 }
 
                 status = "Нашёл: ${found.artist} — ${found.title}. Ищу и качаю…"
+                mark("ожидание yt-dlp")
                 ytReady.await()
+                mark("поиск и скачивание")
                 val file = withContext(Dispatchers.IO) {
                     Downloader.download(app, "${found.artist} ${found.title} audio") { p ->
                         progress = if (p >= 0f) p / 100f else null
@@ -112,11 +157,13 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
                 tracks.add(0, track)
                 store.save(tracks.toList())
                 status = "Добавлено: ${found.artist} — ${found.title}"
-            } catch (e: Exception) {
-                status = "Ошибка: ${e.message}"
+            } catch (e: Throwable) {
+                mark("ошибка: ${e.javaClass.simpleName}")
+                status = "Ошибка: ${e.javaClass.simpleName}: ${e.message}"
             } finally {
                 busy = false
                 progress = null
+                mark("idle")
             }
         }
     }

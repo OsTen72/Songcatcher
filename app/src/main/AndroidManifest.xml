@@ -5,6 +5,7 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
     <application
+        android:name=".SongApp"
         android:label="SongCatcher"
         android:extractNativeLibs="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
