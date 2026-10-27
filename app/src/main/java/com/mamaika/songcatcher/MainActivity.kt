@@ -1,14 +1,23 @@
 package com.mamaika.songcatcher
 
 import android.Manifest
+import android.app.Activity
+import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.BitmapFactory
+import android.media.projection.MediaProjectionManager
+import android.os.Build
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -16,22 +25,31 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.systemBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
@@ -52,22 +70,59 @@ class MainActivity : ComponentActivity() {
 fun App(vm: MainViewModel = viewModel()) {
     val ctx = LocalContext.current
     val clipboard = LocalClipboardManager.current
-    val permissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        if (granted) vm.catchSong() else vm.status = "Нужен доступ к микрофону"
+
+    LaunchedEffect(vm.status) {
+        if (vm.status != "Готов") Toast.makeText(ctx, vm.status, Toast.LENGTH_SHORT).show()
     }
 
-    MaterialTheme {
-        Surface(Modifier.fillMaxSize()) {
+    val notifLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    val projectionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { res ->
+        val data = res.data
+        if (res.resultCode == Activity.RESULT_OK && data != null) {
+            vm.catchSong(Pair(res.resultCode, data))
+        } else {
+            vm.status = "Нужно разрешить запись звука телефона"
+        }
+    }
+
+    fun startCapture() {
+        if (vm.usePhoneAudio) {
+            val mpm = ctx.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            projectionLauncher.launch(mpm.createScreenCaptureIntent())
+        } else {
+            vm.catchSong()
+        }
+    }
+
+    val micLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) startCapture() else vm.status = "Нужен доступ к микрофону"
+    }
+
+    val colors = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()
+
+    MaterialTheme(colorScheme = colors) {
+        Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
             Column(
                 Modifier
                     .fillMaxSize()
                     .systemBarsPadding()
                     .padding(16.dp)
             ) {
-                Text("SongCatcher", style = MaterialTheme.typography.headlineMedium)
-                Spacer(Modifier.height(12.dp))
+                Text("SongCatcher 0.3", style = MaterialTheme.typography.headlineMedium)
+                Spacer(Modifier.height(8.dp))
 
                 vm.report?.let { r ->
                     Surface(
@@ -77,6 +132,7 @@ fun App(vm: MainViewModel = viewModel()) {
                         Column(Modifier.padding(8.dp)) {
                             Text(
                                 r,
+                                color = MaterialTheme.colorScheme.onErrorContainer,
                                 style = MaterialTheme.typography.bodySmall,
                                 modifier = Modifier
                                     .heightIn(max = 160.dp)
@@ -90,7 +146,7 @@ fun App(vm: MainViewModel = viewModel()) {
                             }
                         }
                     }
-                    Spacer(Modifier.height(12.dp))
+                    Spacer(Modifier.height(8.dp))
                 }
 
                 OutlinedTextField(
@@ -100,15 +156,25 @@ fun App(vm: MainViewModel = viewModel()) {
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
-                Spacer(Modifier.height(12.dp))
+
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(if (vm.usePhoneAudio) "Источник: звук телефона" else "Источник: микрофон")
+                    Switch(checked = vm.usePhoneAudio, onCheckedChange = vm::updateUsePhoneAudio)
+                }
 
                 Button(
                     onClick = {
                         val granted = ContextCompat.checkSelfPermission(
                             ctx, Manifest.permission.RECORD_AUDIO
                         ) == PackageManager.PERMISSION_GRANTED
-                        if (granted) vm.catchSong()
-                        else permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                        if (granted) startCapture()
+                        else micLauncher.launch(Manifest.permission.RECORD_AUDIO)
                     },
                     enabled = !vm.busy,
                     modifier = Modifier
@@ -131,18 +197,49 @@ fun App(vm: MainViewModel = viewModel()) {
                     }
                 }
 
-                Spacer(Modifier.height(12.dp))
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = vm.query,
+                    onValueChange = { vm.query = it },
+                    label = { Text("Поиск по трекам") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Spacer(Modifier.height(8.dp))
                 LazyColumn(Modifier.weight(1f)) {
-                    items(vm.tracks, key = { it.id }) { track ->
+                    items(vm.visibleTracks, key = { it.id }) { track ->
                         val current = track.id == vm.currentId
+                        val cover = remember(track.cover) {
+                            if (track.cover.isNotEmpty())
+                                BitmapFactory.decodeFile(track.cover)?.asImageBitmap()
+                            else null
+                        }
                         Row(
                             Modifier
                                 .fillMaxWidth()
                                 .clickable { vm.play(track) }
                                 .padding(vertical = 4.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
+                            Box(Modifier.size(48.dp)) {
+                                if (cover != null) {
+                                    Image(
+                                        bitmap = cover,
+                                        contentDescription = null,
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                } else {
+                                    Surface(
+                                        color = MaterialTheme.colorScheme.surfaceVariant,
+                                        modifier = Modifier.fillMaxSize()
+                                    ) {
+                                        Box(contentAlignment = Alignment.Center) { Text("♪") }
+                                    }
+                                }
+                            }
+                            Spacer(Modifier.width(12.dp))
                             Column(Modifier.weight(1f)) {
                                 Text(
                                     track.title,
@@ -157,26 +254,32 @@ fun App(vm: MainViewModel = viewModel()) {
                                     overflow = TextOverflow.Ellipsis
                                 )
                             }
+                            TextButton(onClick = { vm.export(track) }) { Text("⤓") }
                             TextButton(onClick = { vm.delete(track) }) { Text("✕") }
                         }
                     }
                 }
 
                 vm.currentTrack?.let { t ->
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "${t.artist} — ${t.title}",
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        fontWeight = FontWeight.Bold
+                    )
                     Row(
-                        Modifier
-                            .fillMaxWidth()
-                            .padding(top = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically
+                        Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Text(
-                            "${t.artist} — ${t.title}",
-                            modifier = Modifier.weight(1f),
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
+                        TextButton(onClick = { vm.previous() }) { Text("◀◀") }
                         Button(onClick = { vm.togglePlay() }) {
                             Text(if (vm.isPlaying) "Пауза" else "Играть")
+                        }
+                        TextButton(onClick = { vm.next() }) { Text("▶▶") }
+                        TextButton(onClick = { vm.toggleShuffle() }) {
+                            Text(if (vm.shuffle) "Shuffle ✓" else "Shuffle")
                         }
                     }
                 }

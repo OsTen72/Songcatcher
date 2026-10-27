@@ -2,6 +2,7 @@ package com.mamaika.songcatcher
 
 import android.app.Application
 import android.content.Context
+import android.content.Intent
 import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Build
@@ -12,8 +13,8 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
-import androidx.media3.exoplayer.ExoPlayer
 import com.yausername.youtubedl_android.YoutubeDL
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -27,18 +28,29 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
     private val prefs = app.getSharedPreferences("prefs", Context.MODE_PRIVATE)
     private val store = TrackStore(app)
     private val ytReady = CompletableDeferred<Unit>()
+    private val player = PlayerHolder.get(app)
 
     val tracks = mutableStateListOf<Track>()
     var status by mutableStateOf("Готов")
     var busy by mutableStateOf(false)
     var progress by mutableStateOf<Float?>(null)
     var token by mutableStateOf(prefs.getString("audd_token", "") ?: "")
+    var usePhoneAudio by mutableStateOf(prefs.getBoolean("phone_audio", false))
+    var query by mutableStateOf("")
     var currentId by mutableStateOf<String?>(null)
     var isPlaying by mutableStateOf(false)
+    var shuffle by mutableStateOf(false)
     var report by mutableStateOf<String?>(null)
 
-    private val player: ExoPlayer = ExoPlayer.Builder(app).build()
+    val visibleTracks: List<Track>
+        get() = if (query.isBlank()) tracks.toList() else tracks.filter {
+            it.title.contains(query, true) || it.artist.contains(query, true)
+        }
 
+    val currentTrack: Track?
+        get() = tracks.firstOrNull { it.id == currentId }
+
+    // ---------- диагностика ----------
     private val traceFile = File(app.filesDir, "trace.txt")
     private val crashFile = File(app.filesDir, "crash.txt")
 
@@ -74,19 +86,54 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         if (sb.isNotEmpty()) report = sb.toString()
     }
 
+    // ---------- плеер ----------
+    private val listener = object : Player.Listener {
+        override fun onIsPlayingChanged(playing: Boolean) {
+            isPlaying = playing
+        }
+
+        override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+            currentId = mediaItem?.mediaId
+        }
+
+        override fun onShuffleModeEnabledChanged(enabled: Boolean) {
+            shuffle = enabled
+        }
+    }
+
+    private fun toItem(t: Track): MediaItem {
+        val meta = MediaMetadata.Builder()
+            .setTitle(t.title)
+            .setArtist(t.artist)
+        if (t.cover.isNotEmpty() && File(t.cover).exists()) {
+            meta.setArtworkUri(Uri.fromFile(File(t.cover)))
+        }
+        return MediaItem.Builder()
+            .setMediaId(t.id)
+            .setUri(Uri.fromFile(File(t.path)))
+            .setMediaMetadata(meta.build())
+            .build()
+    }
+
+    private fun indexInPlayer(id: String): Int {
+        for (i in 0 until player.mediaItemCount) {
+            if (player.getMediaItemAt(i).mediaId == id) return i
+        }
+        return -1
+    }
+
     init {
         loadReport()
         tracks.addAll(store.load())
 
-        player.addListener(object : Player.Listener {
-            override fun onIsPlayingChanged(playing: Boolean) {
-                isPlaying = playing
-            }
-
-            override fun onPlaybackStateChanged(state: Int) {
-                if (state == Player.STATE_ENDED) playNext()
-            }
-        })
+        player.addListener(listener)
+        if (player.mediaItemCount == 0) {
+            player.setMediaItems(tracks.map { toItem(it) })
+        }
+        player.repeatMode = Player.REPEAT_MODE_ALL
+        currentId = player.currentMediaItem?.mediaId
+        isPlaying = player.isPlaying
+        shuffle = player.shuffleModeEnabled
 
         viewModelScope.launch(Dispatchers.IO) {
             try {
@@ -108,12 +155,70 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         }
     }
 
+    fun play(track: Track) {
+        val i = indexInPlayer(track.id)
+        if (i < 0) return
+        player.seekToDefaultPosition(i)
+        player.prepare()
+        player.play()
+        try {
+            app.startService(Intent(app, PlaybackService::class.java))
+        } catch (_: Throwable) {
+        }
+    }
+
+    fun togglePlay() {
+        if (player.isPlaying) {
+            player.pause()
+        } else if (currentId != null) {
+            player.prepare()
+            player.play()
+        } else if (tracks.isNotEmpty()) {
+            play(tracks[0])
+        }
+    }
+
+    fun next() = player.seekToNextMediaItem()
+    fun previous() = player.seekToPreviousMediaItem()
+
+    fun toggleShuffle() {
+        player.shuffleModeEnabled = !player.shuffleModeEnabled
+    }
+
+    fun delete(track: Track) {
+        val i = indexInPlayer(track.id)
+        if (i >= 0) player.removeMediaItem(i)
+        if (player.mediaItemCount == 0) currentId = null
+        File(track.path).delete()
+        if (track.cover.isNotEmpty()) File(track.cover).delete()
+        tracks.remove(track)
+        store.save(tracks.toList())
+    }
+
+    fun export(track: Track) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                Exporter.export(app, track)
+                status = "Сохранено в Музыка/SongCatcher: ${track.artist} — ${track.title}"
+            } catch (e: Throwable) {
+                status = "Ошибка экспорта: ${e.message}"
+            }
+        }
+    }
+
+    // ---------- настройки ----------
     fun updateToken(value: String) {
         token = value
         prefs.edit().putString("audd_token", value.trim()).apply()
     }
 
-    fun catchSong() {
+    fun updateUsePhoneAudio(value: Boolean) {
+        usePhoneAudio = value
+        prefs.edit().putBoolean("phone_audio", value).apply()
+    }
+
+    // ---------- главная кнопка ----------
+    fun catchSong(projection: Pair<Int, Intent>? = null) {
         if (busy) return
         if (token.isBlank()) {
             status = "Сначала вставь токен AudD"
@@ -123,15 +228,22 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
             busy = true
             progress = null
             try {
+                if (player.isPlaying) player.pause()
+
                 mark("запись")
-                status = "Слушаю 10 секунд…"
-                val clip = recordClip()
+                val phoneMode = usePhoneAudio && projection != null
+                status = if (phoneMode) "Слушаю звук телефона 10 секунд…" else "Слушаю микрофон 10 секунд…"
+                val clip = if (phoneMode) {
+                    CaptureService.capture(app, projection!!.first, projection.second)
+                } else {
+                    recordMic()
+                }
 
                 mark("распознавание")
                 status = "Распознаю…"
                 val found = withContext(Dispatchers.IO) { Recognizer.recognize(token.trim(), clip) }
                 if (found == null) {
-                    status = "Не удалось распознать. Поднеси телефон ближе к источнику звука"
+                    status = "Не удалось распознать. Попробуй другой фрагмент песни"
                     return@launch
                 }
 
@@ -153,13 +265,26 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
                     }
                 }
 
-                val track = Track(file.nameWithoutExtension, found.artist, found.title, file.absolutePath)
+                val id = file.nameWithoutExtension
+                val coverPath = withContext(Dispatchers.IO) {
+                    val url = found.coverUrl
+                    if (url == null) {
+                        ""
+                    } else {
+                        val dir = File(app.filesDir, "covers").apply { mkdirs() }
+                        val dest = File(dir, "$id.jpg")
+                        if (Recognizer.downloadCover(url, dest)) dest.absolutePath else ""
+                    }
+                }
+
+                val track = Track(id, found.artist, found.title, file.absolutePath, coverPath)
                 tracks.add(0, track)
+                player.addMediaItem(0, toItem(track))
                 store.save(tracks.toList())
                 status = "Добавлено: ${found.artist} — ${found.title}"
             } catch (e: Throwable) {
                 mark("ошибка: ${e.javaClass.simpleName}")
-                status = "Ошибка: ${e.javaClass.simpleName}: ${e.message}"
+                status = "Ошибка: ${e.message ?: e.javaClass.simpleName}"
             } finally {
                 busy = false
                 progress = null
@@ -168,7 +293,7 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private suspend fun recordClip(): File = withContext(Dispatchers.IO) {
+    private suspend fun recordMic(): File = withContext(Dispatchers.IO) {
         val out = File(app.cacheDir, "clip.m4a")
         if (out.exists()) out.delete()
         val rec = if (Build.VERSION.SDK_INT >= 31) {
@@ -194,37 +319,8 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         out
     }
 
-    fun play(track: Track) {
-        currentId = track.id
-        player.setMediaItem(MediaItem.fromUri(Uri.fromFile(File(track.path))))
-        player.prepare()
-        player.play()
-    }
-
-    fun togglePlay() {
-        if (player.isPlaying) player.pause() else if (currentId != null) player.play()
-    }
-
-    private fun playNext() {
-        val i = tracks.indexOfFirst { it.id == currentId }
-        // новые треки добавляются в начало, поэтому "следующий" — это элемент ниже по списку
-        if (i >= 0 && i + 1 < tracks.size) play(tracks[i + 1])
-    }
-
-    fun delete(track: Track) {
-        if (track.id == currentId) {
-            player.stop()
-            currentId = null
-        }
-        File(track.path).delete()
-        tracks.remove(track)
-        store.save(tracks.toList())
-    }
-
-    val currentTrack: Track?
-        get() = tracks.firstOrNull { it.id == currentId }
-
     override fun onCleared() {
-        player.release()
+        // плеер общий с фоновым сервисом, его не освобождаем
+        player.removeListener(listener)
     }
 }
